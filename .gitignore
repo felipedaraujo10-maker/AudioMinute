@@ -1,0 +1,20 @@
+# Ambiente virtual
+venv/
+.venv/
+env/
+
+# Chaves e segredos
+.env
+.streamlit/secrets.toml
+
+# Cache Python
+__pycache__/
+*.py[cod]
+
+# Arquivos gerados
+*.docx
+*.txt
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
