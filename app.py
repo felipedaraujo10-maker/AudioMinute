@@ -1,7 +1,8 @@
 
 import io
 import os
-from datetime import date
+import time
+import random
 
 import streamlit as st
 from google import genai
@@ -70,7 +71,7 @@ st.divider()
 
 
 # ============================================================
-# CHAVE DO GEMINI
+# CONFIGURAÇÃO DA CHAVE DO GEMINI
 # ============================================================
 
 def obter_api_key():
@@ -97,8 +98,65 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-# Modelo multimodal para processar áudio e texto.
+# Modelo indicado pela mensagem de erro recebida anteriormente.
+# Se ele não estiver disponível para sua conta, consulte os modelos
+# disponíveis no Google AI Studio.
 MODELO = "gemini-3.8-flash"
+
+
+# ============================================================
+# TENTATIVAS AUTOMÁTICAS EM CASO DE ERRO TEMPORÁRIO
+# ============================================================
+
+def gerar_conteudo_com_retry(**kwargs):
+    """
+    Tenta novamente quando o Gemini retorna erros temporários.
+    Realiza até 3 tentativas no total.
+    """
+
+    for tentativa in range(3):
+        try:
+            return client.models.generate_content(**kwargs)
+
+        except Exception as erro:
+            mensagem = str(erro).upper()
+
+            codigos_temporarios = [
+                "503",
+                "UNAVAILABLE",
+                "429",
+                "RESOURCE_EXHAUSTED",
+                "500",
+                "INTERNAL",
+                "502",
+                "504",
+                "DEADLINE_EXCEEDED",
+            ]
+
+            erro_temporario = any(
+                codigo in mensagem
+                for codigo in codigos_temporarios
+            )
+
+            # Não repetir erros permanentes, como modelo inexistente
+            # ou chave inválida.
+            if not erro_temporario or tentativa == 2:
+                raise
+
+            # Espera progressiva com pequena variação aleatória.
+            tempo_espera = (2 ** (tentativa + 2)) + random.uniform(0, 1)
+
+            st.warning(
+                "O Gemini está temporariamente indisponível. "
+                f"Nova tentativa em aproximadamente "
+                f"{tempo_espera:.0f} segundos..."
+            )
+
+            time.sleep(tempo_espera)
+
+    raise RuntimeError(
+        "Não foi possível obter uma resposta do Gemini após as tentativas."
+    )
 
 
 # ============================================================
@@ -115,11 +173,20 @@ MIME_TYPES = {
 
 def obter_mime_type(nome_arquivo):
     extensao = os.path.splitext(nome_arquivo)[1].lower()
-    return MIME_TYPES.get(extensao, "application/octet-stream")
+
+    mime_type = MIME_TYPES.get(extensao)
+
+    if not mime_type:
+        raise ValueError(
+            "Formato de áudio não suportado. "
+            "Envie um arquivo MP3, WAV, M4A ou MPEG."
+        )
+
+    return mime_type
 
 
 # ============================================================
-# TRANSCRIÇÃO
+# TRANSCRIÇÃO DO ÁUDIO
 # ============================================================
 
 def transcrever_audio(arquivo):
@@ -131,18 +198,18 @@ def transcrever_audio(arquivo):
     mime_type = obter_mime_type(arquivo.name)
 
     prompt = """
-    Transcreva integralmente o áudio fornecido para português brasileiro.
+Transcreva integralmente o áudio fornecido para português brasileiro.
 
-    Instruções:
-    - Escreva somente o que for possível ouvir.
-    - Preserve nomes, números, datas, tarefas e prazos mencionados.
-    - Não invente palavras ou informações.
-    - Se algum trecho não puder ser compreendido, indique
-      [trecho inaudível].
-    - Retorne somente a transcrição, sem comentários.
-    """
+Instruções:
+- Escreva somente o que for possível ouvir.
+- Preserve nomes, números, datas, tarefas e prazos mencionados.
+- Não invente palavras ou informações.
+- Se algum trecho não puder ser compreendido, indique
+  [trecho inaudível].
+- Retorne somente a transcrição, sem comentários.
+"""
 
-    resposta = client.models.generate_content(
+    resposta = gerar_conteudo_com_retry(
         model=MODELO,
         contents=[
             types.Part.from_bytes(
@@ -157,7 +224,9 @@ def transcrever_audio(arquivo):
     )
 
     if not resposta.text:
-        raise ValueError("O Gemini não retornou uma transcrição.")
+        raise ValueError(
+            "O Gemini não retornou uma transcrição."
+        )
 
     return resposta.text.strip()
 
@@ -218,7 +287,7 @@ TRANSCRIÇÃO:
 </transcricao>
 """
 
-    resposta = client.models.generate_content(
+    resposta = gerar_conteudo_com_retry(
         model=MODELO,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -227,7 +296,9 @@ TRANSCRIÇÃO:
     )
 
     if not resposta.text:
-        raise ValueError("O Gemini não retornou a ata.")
+        raise ValueError(
+            "O Gemini não retornou a ata."
+        )
 
     return resposta.text.strip()
 
@@ -261,16 +332,19 @@ def criar_docx(texto):
 
         # Linhas de tabela Markdown
         elif linha.startswith("|"):
-            if not set(linha.replace("|", "").replace(":", "").replace("-", "").replace(" ", "")):
-                continue
-
             valores = [
                 item.strip()
                 for item in linha.strip("|").split("|")
             ]
 
-            if valores:
-                linhas_tabela.append(valores)
+            # Ignorar a linha separadora da tabela Markdown.
+            if all(
+                not valor.replace("-", "").replace(":", "").strip()
+                for valor in valores
+            ):
+                continue
+
+            linhas_tabela.append(valores)
 
         # Listas
         elif linha.startswith("- ") or linha.startswith("* "):
@@ -279,20 +353,35 @@ def criar_docx(texto):
                 style="List Bullet"
             )
 
+        # Listas numeradas
+        elif (
+            len(linha) > 2
+            and linha[0].isdigit()
+            and linha[1:3] in [". ", ") "]
+        ):
+            documento.add_paragraph(
+                linha[3:].strip(),
+                style="List Number"
+            )
+
         # Texto normal
         else:
             documento.add_paragraph(linha)
 
-    # Montar a tabela do plano de ação
+    # Criar a tabela do plano de ação, se houver dados.
     if linhas_tabela:
-        numero_colunas = max(len(linha) for linha in linhas_tabela)
+        numero_colunas = max(
+            len(linha) for linha in linhas_tabela
+        )
 
         tabela = documento.add_table(
             rows=1,
             cols=numero_colunas
         )
+
         tabela.style = "Table Grid"
 
+        # Cabeçalho
         for i in range(numero_colunas):
             tabela.rows[0].cells[i].text = (
                 linhas_tabela[0][i]
@@ -300,19 +389,15 @@ def criar_docx(texto):
                 else ""
             )
 
+        # Linhas de dados
         for linha in linhas_tabela[1:]:
-            # Ignora uma eventual linha separadora Markdown.
-            if all(
-                not valor.replace("-", "").replace(":", "").strip()
-                for valor in linha
-            ):
-                continue
-
             celulas = tabela.add_row().cells
 
             for i in range(numero_colunas):
                 celulas[i].text = (
-                    linha[i] if i < len(linha) else ""
+                    linha[i]
+                    if i < len(linha)
+                    else ""
                 )
 
     arquivo = io.BytesIO()
@@ -344,12 +429,17 @@ if arquivo_audio:
 
     tamanho_mb = arquivo_audio.size / (1024 * 1024)
 
-    st.success(f"Arquivo carregado: {arquivo_audio.name}")
-    st.caption(f"Tamanho: {tamanho_mb:.2f} MB")
+    st.success(
+        f"Arquivo carregado: {arquivo_audio.name}"
+    )
+
+    st.caption(
+        f"Tamanho: {tamanho_mb:.2f} MB"
+    )
 
 
 # ============================================================
-# PROCESSAMENTO
+# PROCESSAMENTO DA REUNIÃO
 # ============================================================
 
 if arquivo_audio:
@@ -360,38 +450,62 @@ if arquivo_audio:
         type="primary",
         use_container_width=True
     ):
+
         try:
-            # Etapa 1: transcrição
+            # ETAPA 1 — TRANSCRIÇÃO
             st.subheader("🎧 Etapa 1 — Transcrição")
 
-            with st.spinner("O Gemini está transcrevendo o áudio..."):
-                transcricao = transcrever_audio(arquivo_audio)
+            with st.spinner(
+                "O Gemini está transcrevendo o áudio..."
+            ):
+                transcricao = transcrever_audio(
+                    arquivo_audio
+                )
 
-            st.success("Transcrição concluída!")
+            st.success(
+                "Transcrição concluída!"
+            )
 
-            with st.expander("📝 Visualizar transcrição"):
+            with st.expander(
+                "📝 Visualizar transcrição"
+            ):
                 st.text_area(
                     "Texto reconhecido",
                     value=transcricao,
                     height=220
                 )
 
-            # Etapa 2: geração da ata
-            st.subheader("🤖 Etapa 2 — Organização com IA")
+            # ETAPA 2 — GERAÇÃO DA ATA
+            st.subheader(
+                "🤖 Etapa 2 — Organização com IA"
+            )
 
-            with st.spinner("O Gemini está organizando a reunião..."):
-                ata = gerar_ata(transcricao)
+            with st.spinner(
+                "O Gemini está organizando a reunião..."
+            ):
+                ata = gerar_ata(
+                    transcricao
+                )
 
-            st.success("Ata criada com sucesso!")
+            st.success(
+                "Ata criada com sucesso!"
+            )
 
-            # Etapa 3: resultado
+            # ETAPA 3 — EXIBIR RESULTADO
             st.divider()
-            st.header("2. 📋 Ata da reunião")
+
+            st.header(
+                "2. 📋 Ata da reunião"
+            )
+
             st.markdown(ata)
 
-            # Etapa 4: downloads
+            # ETAPA 4 — DOWNLOADS
             st.divider()
-            st.header("3. 📥 Exportar resultado")
+
+            st.header(
+                "3. 📥 Exportar resultado"
+            )
 
             col1, col2 = st.columns(2)
 
@@ -418,15 +532,19 @@ if arquivo_audio:
                     use_container_width=True
                 )
 
-        except Exception:
+        except Exception as erro:
             st.error(
                 "Não foi possível processar a reunião. "
-                "Confira a chave, os limites da API e o formato do áudio."
+                "Confira a disponibilidade do modelo, a chave da API "
+                "e os limites de uso."
             )
 
-            with st.expander("Ver detalhes do erro"):
-                import traceback
-                st.code(traceback.format_exc())
+            with st.expander(
+                "Ver detalhes do erro"
+            ):
+                st.code(
+                    f"{type(erro).__name__}: {erro}"
+                )
 
 
 # ============================================================
