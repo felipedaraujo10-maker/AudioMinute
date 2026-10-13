@@ -98,7 +98,7 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 
 # Modelo multimodal para processar áudio e texto.
-MODELO = "gemini-2.5-flash"
+MODELO = "gemini-3.8-flash"
 
 
 # ============================================================
